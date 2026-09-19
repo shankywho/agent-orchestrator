@@ -60,6 +60,36 @@ func repoTeardownLock(repo string) (func(), error) {
 	return m.Unlock, nil
 }
 
+// repoPrLock serializes the SPAWN lane per repository. `git worktree add`
+// writes branch.<name>.remote/merge into .git/config, whose `.config.lock`
+// races when concurrent spawns target the same repo (#4350): the loser exits
+// 255 ("could not lock config file") and surfaces as an opaque 500. Teardown
+// already has this same per-repo fence (repoTeardownLock); spawn must hold the
+// analogous one for the duration of fetch+add so all spawns funnel through the
+// same serialization as teardown. Mirrors live in their own lane and never
+// take this lock, so restoring a repo is never delayed behind a sibling spawn;
+// different repositories stay unlocked and spawn in parallel.
+var (
+	spawnMu    sync.Mutex
+	spawnLocks = map[string]*sync.Mutex{}
+)
+
+func repoSpawnLock(repo string) (func(), error) {
+	key, err := physicalAbs(repo)
+	if err != nil {
+		return nil, err
+	}
+	spawnMu.Lock()
+	m := spawnLocks[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		spawnLocks[key] = m
+	}
+	spawnMu.Unlock()
+	m.Lock()
+	return m.Unlock, nil
+}
+
 // ErrPreservedConflict is an adapter-local alias of ports.ErrPreservedConflict.
 // Tests inside this package use this name; callers outside use ports.ErrPreservedConflict
 // and errors.Is works because the adapter wraps the ports sentinel.
@@ -1293,6 +1323,20 @@ func registeredWorktreeDirMissing(rec worktreeRecord) (bool, error) {
 }
 
 func (w *Workspace) addWorktree(ctx context.Context, repo, path, branch, baseBranch, baseRef string, resolveExistingBase bool) (string, error) {
+	// Concurrent spawns against one repo race the create lane: `git fetch` and
+	// `git worktree add` both write .git/config via git's config.lock, so the
+	// loser dies with `could not lock config file ... exit status 255` and
+	// surfaces as an opaque 500 (#4350). Serialize the spawn lane per repo the
+	// same way teardown already does (repoTeardownLock). Different repositories
+	// have independent locks and still spawn in parallel; mirrors and restores
+	// funnel through addWorktree too fro the same fence; teardown takes its own
+	// lock and never takes this one, so the two lanes stay orthogonal.
+	unlock, err := repoSpawnLock(repo)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+
 	// Refuse early if the branch is already checked out in another worktree:
 	// `git worktree add` will fail, but its stderr leaks through as an opaque
 	// 500. A typed sentinel lets the HTTP layer surface a 409.
